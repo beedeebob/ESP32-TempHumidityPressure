@@ -12,7 +12,7 @@
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_spi_flash.h"
-#include "DHT22.h"
+#include "tempHumidityPres.h"
 
 void app_main(void)
 {
@@ -34,7 +34,7 @@ void app_main(void)
 
     printf("Minimum free heap size: %d bytes\n", esp_get_minimum_free_heap_size());
 
-    DHT22_Init();
+    THP_init();
 
     while(1)
     {

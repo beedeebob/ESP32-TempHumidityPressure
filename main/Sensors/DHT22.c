@@ -6,33 +6,16 @@
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_spi_flash.h"
-#include "driver/rmt.h"
 #include "driver/gpio.h"
+#include "DHT22.h"
 
 /* Definitions ---------------------------------------------------------------------------- */
-#define DHT22_UPDATEPERIOD                      10000        //Update every 10 seconds
-
 /* Types ---------------------------------------------------------------------------------- */
-typedef struct
-{
-    rmt_channel_t rmt;
-    uint8_t pin;
-    RingbufHandle_t buff;
-
-    //Results
-    int32_t temperature;
-    int32_t humidity;
-}DHT22_TypeDef;
-
 /* Variables ------------------------------------------------------------------------------ */
-static DHT22_TypeDef dht22 = 
-{
-    RMT_CHANNEL_0, 4, NULL, 0, 0
-};
-
 /* Function Prototypes -------------------------------------------------------------------- */
 static void DHT22_ControlTask(void *pvParameter);
 static void DHT22_ReadTemperatureHumidity(DHT22_TypeDef *dht);
+static void DHT22_DecodeResults(DHT22_TypeDef *dht, rmt_item32_t *items, uint32_t itemCount);
 
 /* Notes ---------------------------------------------------------------------------------- */
 /*
@@ -44,10 +27,10 @@ SIGNAL FORM
                     |              |                               |                   |                      |
                     | Start: Host  |                               |                   |                      |
         ____________                _________             ___________           ________          _____________
-                    \    1ms       / 20-40us \   80us    /  80us   | \  50us  / 26-28us \  50us  /   70us      \
+                    \    >1ms      / 20-40us \   80us    /  80us   | \  50us  / 26-28us \  50us  /   70us      \
                     |\____________/|          \_________/          |  \______/         | \______/             | \
                     |              |                               |                   |                      |
-                    |              | Sensor Response               | Bit 1 (0)         | Bit 2 (1)            |
+                    |              | Sensor: Response              | Bit 1 (0)         | Bit 2 (1)            |
 
 
     1. Start signal from MCU
@@ -76,30 +59,55 @@ DATA FORMAT
  * @param   None
  * @result  None
  */
-void DHT22_Init(void)
+DHT22_TypeDef* DHT22_Init(rmt_channel_t RMT_CHANNEL, uint8_t GPIO_PIN)
 {
     //Initialize the DHT22 device
+    DHT22_TypeDef *pDHT = (DHT22_TypeDef *)malloc(sizeof(DHT22_TypeDef));
+    if (pDHT == NULL)
+        return NULL;
 
-    //Setup the rmt
+    pDHT->rmt = RMT_CHANNEL;
+    pDHT->pin = GPIO_PIN;
+    pDHT->buff = NULL;
+    pDHT->temperature = 0;
+    pDHT->humidity = 0;
+    pDHT->task = NULL;
+    pDHT->updated = NULL;
+
+    // Setup the rmt
     rmt_config_t config;
     config.rmt_mode = RMT_MODE_RX;
-    config.channel = dht22.rmt;
-    config.gpio_num = (gpio_num_t)dht22.pin;
-    config.mem_block_num = 2;
-    config.rx_config.filter_en = 1;
-    config.rx_config.filter_ticks_thresh = 10;
+    config.channel = pDHT->rmt;
+    config.gpio_num = (gpio_num_t)pDHT->pin;
+    config.mem_block_num = 1;
+    config.rx_config.filter_en = true;
+    config.rx_config.filter_ticks_thresh = 200;
     config.rx_config.idle_threshold = 1000;
     config.clk_div = 80;
     rmt_config(&config);
-    rmt_driver_install(dht22.rmt, 400, 0);  // 400 words for ringbuffer containing pulse trains from DHT
-    rmt_get_ringbuf_handle(dht22.rmt, &dht22.buff);
+    rmt_driver_install(pDHT->rmt, 1000, 0);  // 400 words for ringbuffer containing pulse trains from DHT
+    rmt_get_ringbuf_handle(pDHT->rmt, &pDHT->buff);
 
     //Setup GPIO
-    gpio_set_direction(dht22.pin, GPIO_MODE_OUTPUT_OD);
-    gpio_set_level(dht22.pin, 1);
+    gpio_set_direction(pDHT->pin, GPIO_MODE_OUTPUT_OD);
+    gpio_set_level(pDHT->pin, 1);
 
     //Start the control task
-    xTaskCreate(&DHT22_ControlTask, "DHT22_ControlTask", 2048, &dht22, 1, NULL);
+    xTaskCreate(&DHT22_ControlTask, "DHT22_ControlTask", 2048, pDHT, 5, &pDHT->task);
+
+    return pDHT;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+/* @details Start reading the temperature and humidity
+ * @param   pDHT: pointer to the temperature struct
+ * @param   updateCB: pointer to the update callback routine
+ * @result  None
+ */
+void DHT22_StartUpdateTemperatureAndHumidity(DHT22_TypeDef *pDHT, DHT22_TemperatureAndHumidityUpdateCallback updateCB)
+{
+    pDHT->updated = updateCB;
+    xTaskNotifyGive(pDHT->task);
 }
 
 /* ---------------------------------------------------------------------------------------- */
@@ -109,41 +117,16 @@ void DHT22_Init(void)
  */
 static void DHT22_ControlTask(void *pvParameter)
 {
-    printf("Task 'DHT22_ControlTask' start.\n");
     DHT22_TypeDef *dht = (DHT22_TypeDef *)pvParameter;
-    static uint32_t tickval = 0;
     while (1) 
     {
-
-        //TESTING
-        vTaskDelay(1000 / portTICK_RATE_MS);
-        gpio_set_level(dht22.pin, 0);
-        vTaskDelay(1000 / portTICK_RATE_MS);
-        gpio_set_level(dht22.pin, 1);
-        continue;
-
-        tickval = xTaskGetTickCount();
+        ulTaskNotifyTake(true, portMAX_DELAY);
 
         DHT22_ReadTemperatureHumidity(dht);
 
-        //Delay till next loop
-        /*  
-            EQUATION 1
-            timeTotal = DHT22_UPDATEPERIOD  //ms
-
-            EQUATION 2
-            timePassed = (xTaskGetTickCount() - tickval) * portTICK_RATE_MS  //ms
-
-            EQUATION 3
-            time = timeTotal - timePassed   //ms
-                time = DHT22_UPDATEPERIOD - ((xTaskGetTickCount() - tickval) * portTICK_RATE_MS)
-
-            EQUATION 4
-            delay = time / portTICK_RATE_MS
-                delay = (DHT22_UPDATEPERIOD - ((xTaskGetTickCount() - tickval) * portTICK_RATE_MS))/ portTICK_RATE_MS
-                delay = (DHT22_UPDATEPERIOD / portTICK_RATE_MS) - xTaskGetTickCount() + tickval
-            */
-        vTaskDelay((DHT22_UPDATEPERIOD / portTICK_RATE_MS) - xTaskGetTickCount() + tickval);
+        //Notify updated
+        if(dht->updated != NULL)
+            dht->updated(dht);
     }
     fflush(stdout);
 }
@@ -155,17 +138,60 @@ static void DHT22_ControlTask(void *pvParameter)
  */
 static void DHT22_ReadTemperatureHumidity(DHT22_TypeDef *dht) 
 {
-    printf("Reading temperature and humidity....\n");
+    printf("DHT22: Reading temperature and humidity....\n");
 
-    //Configure pin as output
+    //Start rmt receive
+    printf("DHT22: Start RMT\n");
+    rmt_rx_start(dht->rmt, true);
 
-    //Drive pin low for 2ms
+    //Configure GPIO
+    printf("DHT22: Pin low\n");
+    gpio_set_direction(dht->pin, GPIO_MODE_OUTPUT_OD);
+    gpio_set_level(dht->pin, 0);
 
-    //Configre pin as RMT
+    //Start signal
+    printf("DHT22: Wait.\n");
+    uint32_t tick = xTaskGetTickCount();
+    while((xTaskGetTickCount() - tick) < 2)
+        vTaskDelay(portTICK_RATE_MS);
 
-    //Configure rmt receive
+    //Configure GPIO
+    printf("DHT22: Pin input\n");
+    rmt_set_pin(dht->rmt, RMT_MODE_RX, dht->pin);
+    gpio_set_direction(dht->pin, GPIO_MODE_INPUT);
+    //rmt_set_gpio(dht->rmt, RMT_MODE_RX, (gpio_num_t)dht->pin, false);
 
     //Wait for completion
+    size_t rx_size = 0;
+    printf("DHT22: Awaiting completion\n");
+    rmt_item32_t* items = (rmt_item32_t*)xRingbufferReceive(dht->buff, &rx_size, 1000);
 
     //Handle results
+    printf("DHT22: Results: %u...\n", rx_size);
+    if (items != NULL)
+    {
+        printf("Results: Decode\n");
+        DHT22_DecodeResults(dht, items, rx_size/sizeof(rmt_item32_t));
+        vRingbufferReturnItem(dht->buff, items);
+    }
+
+    //Clean up peripherals
+    printf("RX: Reset peripherals\n");
+    rmt_rx_stop(dht->rmt);
+    gpio_set_direction(dht->pin, GPIO_MODE_OUTPUT_OD);
+    gpio_set_level(dht->pin, 1);
+    
+    printf("Reading temperature and humidity: Complete\n");
+}
+
+/* ---------------------------------------------------------------------------------------- */
+/* @details Decode the RMT items to DHT22 values
+ * @param   dht: Pointer to the DHT22 device
+ * @param   items: Pointer to the items to decode
+ * @param   itemCount: Number of items
+ * @result  None
+ */
+static void DHT22_DecodeResults(DHT22_TypeDef *dht, rmt_item32_t* items, uint32_t itemCount) 
+{
+    printf("Decode: %u items\n", itemCount);
 }
